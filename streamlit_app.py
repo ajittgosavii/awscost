@@ -1093,21 +1093,12 @@ Provide executive summary and 5 actionable recommendations."""
 
 
 def show_multi_account_view(analyzer, months_back, user):
-    """Multi-account cost view"""
+    """Multi-account cost view with scalability for 100+ accounts"""
     st.header("🌍 Multi-Account Cost Analysis")
     st.caption("Consolidated view across AWS accounts")
     
     # Get linked accounts
     accounts = analyzer.get_linked_accounts()
-    
-    if accounts:
-        st.success(f"✅ Found {len(accounts)} linked accounts")
-        
-        # Display accounts
-        for account in accounts[:5]:
-            st.info(f"**{account['Name']}** - {account['Id']}")
-    else:
-        st.info("ℹ️ Single account mode - enable AWS Organizations for multi-account view")
     
     # Get account costs
     end_date = datetime.now().date()
@@ -1119,46 +1110,333 @@ def show_multi_account_view(analyzer, months_back, user):
             end_date.strftime('%Y-%m-%d')
         )
     
-    if not account_df.empty:
-        account_df['Period'] = pd.to_datetime(account_df['Period'])
+    if account_df.empty:
+        st.info("ℹ️ Single account mode - enable AWS Organizations for multi-account view")
+        return
+    
+    # Process data
+    account_df['Period'] = pd.to_datetime(account_df['Period'])
+    current_period = account_df['Period'].max()
+    current_accounts = account_df[account_df['Period'] == current_period].sort_values('Cost', ascending=False)
+    
+    # Create account mapping with names
+    account_names = {}
+    if accounts:
+        for acc in accounts:
+            account_names[acc['Id']] = acc['Name']
+    
+    # Add account names to dataframe
+    if account_names:
+        current_accounts['AccountName'] = current_accounts['AccountId'].map(
+            lambda x: account_names.get(x, x)
+        )
+        account_df['AccountName'] = account_df['AccountId'].map(
+            lambda x: account_names.get(x, x)
+        )
+    else:
+        current_accounts['AccountName'] = current_accounts['AccountId']
+        account_df['AccountName'] = account_df['AccountId']
+    
+    # =========================
+    # CONSOLIDATED VIEW (ALWAYS SHOWN)
+    # =========================
+    st.subheader("📊 Consolidated View - All Accounts")
+    
+    total_accounts = len(current_accounts)
+    total_cost = current_accounts['Cost'].sum()
+    avg_cost = current_accounts['Cost'].mean()
+    max_account = current_accounts.iloc[0]
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Total Accounts", total_accounts)
+    with col2:
+        st.metric("Total Cost", f"${total_cost:,.2f}")
+    with col3:
+        st.metric("Average Cost/Account", f"${avg_cost:,.2f}")
+    with col4:
+        st.metric("Highest Cost", f"${max_account['Cost']:,.2f}")
+    
+    # Cost distribution
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Top 10 accounts pie chart
+        top_10_accounts = current_accounts.head(10)
+        other_cost = total_cost - top_10_accounts['Cost'].sum()
         
-        # Current month summary
-        current_period = account_df['Period'].max()
-        current_accounts = account_df[account_df['Period'] == current_period].sort_values('Cost', ascending=False)
+        if other_cost > 0:
+            # Add "Others" category
+            display_data = pd.concat([
+                top_10_accounts[['AccountName', 'Cost']],
+                pd.DataFrame([{'AccountName': 'Others', 'Cost': other_cost}])
+            ])
+        else:
+            display_data = top_10_accounts[['AccountName', 'Cost']]
         
-        st.subheader("💰 Current Month by Account")
+        fig_pie = px.pie(
+            display_data,
+            values='Cost',
+            names='AccountName',
+            title=f'Cost Distribution (Top 10 of {total_accounts} accounts)',
+            hole=0.3
+        )
+        st.plotly_chart(fig_pie, use_container_width=True)
+    
+    with col2:
+        # Top accounts table
+        st.markdown("**🏆 Top 10 Cost Accounts**")
+        st.dataframe(
+            top_10_accounts[['AccountName', 'AccountId', 'Cost']].style.format({
+                'Cost': '${:,.2f}'
+            }),
+            use_container_width=True,
+            height=400
+        )
+    
+    st.markdown("---")
+    
+    # =========================
+    # ACCOUNT SELECTOR
+    # =========================
+    st.subheader("🔍 Detailed Account Analysis")
+    
+    col1, col2, col3 = st.columns([2, 1, 1])
+    
+    with col1:
+        # Create account options
+        account_options = ["📊 All Accounts (Overview)"] + [
+            f"{row['AccountName']} ({row['AccountId']}) - ${row['Cost']:,.2f}"
+            for _, row in current_accounts.iterrows()
+        ]
         
-        col1, col2 = st.columns([2, 1])
+        selected_account = st.selectbox(
+            "Select Account",
+            account_options,
+            help="Choose an account to view detailed analysis"
+        )
+    
+    with col2:
+        # Search filter
+        search_term = st.text_input("🔎 Search Account", placeholder="Name or ID")
+    
+    with col3:
+        # Sort options
+        sort_by = st.selectbox("Sort By", ["Cost (High to Low)", "Cost (Low to High)", "Name (A-Z)", "ID"])
+    
+    # =========================
+    # FILTER & SORT ACCOUNTS
+    # =========================
+    filtered_accounts = current_accounts.copy()
+    
+    # Apply search filter
+    if search_term:
+        filtered_accounts = filtered_accounts[
+            filtered_accounts['AccountName'].str.contains(search_term, case=False, na=False) |
+            filtered_accounts['AccountId'].str.contains(search_term, case=False, na=False)
+        ]
+    
+    # Apply sorting
+    if sort_by == "Cost (High to Low)":
+        filtered_accounts = filtered_accounts.sort_values('Cost', ascending=False)
+    elif sort_by == "Cost (Low to High)":
+        filtered_accounts = filtered_accounts.sort_values('Cost', ascending=True)
+    elif sort_by == "Name (A-Z)":
+        filtered_accounts = filtered_accounts.sort_values('AccountName')
+    elif sort_by == "ID":
+        filtered_accounts = filtered_accounts.sort_values('AccountId')
+    
+    st.markdown("---")
+    
+    # =========================
+    # SHOW SELECTED VIEW
+    # =========================
+    
+    if selected_account == "📊 All Accounts (Overview)":
+        # SHOW ALL ACCOUNTS VIEW
+        st.subheader("📋 All Accounts Overview")
+        
+        tabs = st.tabs(["📊 Table View", "📈 Charts", "📉 Trends"])
+        
+        with tabs[0]:
+            # Paginated table view
+            st.markdown(f"**Showing {len(filtered_accounts)} of {total_accounts} accounts**")
+            
+            # Add cost categories
+            filtered_accounts['Category'] = pd.cut(
+                filtered_accounts['Cost'],
+                bins=[0, 100, 1000, 10000, float('inf')],
+                labels=['💚 Low (<$100)', '💛 Medium ($100-$1K)', '🟠 High ($1K-$10K)', '🔴 Very High (>$10K)']
+            )
+            
+            st.dataframe(
+                filtered_accounts[['Category', 'AccountName', 'AccountId', 'Cost']].style.format({
+                    'Cost': '${:,.2f}'
+                }),
+                use_container_width=True,
+                height=600
+            )
+            
+            # Export button
+            csv = filtered_accounts[['AccountName', 'AccountId', 'Cost']].to_csv(index=False)
+            st.download_button(
+                "📥 Download Account List (CSV)",
+                csv,
+                f"all_accounts_{datetime.now().strftime('%Y%m%d')}.csv",
+                use_container_width=True
+            )
+        
+        with tabs[1]:
+            # Bar chart for all accounts (top 20)
+            st.markdown("**Top 20 Accounts by Cost**")
+            top_20 = filtered_accounts.head(20)
+            
+            fig_bar = px.bar(
+                top_20,
+                y='AccountName',
+                x='Cost',
+                orientation='h',
+                title='Top 20 Accounts',
+                color='Cost',
+                color_continuous_scale='Reds',
+                text='Cost'
+            )
+            fig_bar.update_traces(texttemplate='$%{text:,.0f}', textposition='outside')
+            fig_bar.update_layout(height=max(400, len(top_20) * 30))
+            st.plotly_chart(fig_bar, use_container_width=True)
+        
+        with tabs[2]:
+            # Trend for top 10 accounts
+            st.markdown("**Cost Trends - Top 10 Accounts**")
+            top_10_ids = current_accounts.head(10)['AccountId'].tolist()
+            trend_data = account_df[account_df['AccountId'].isin(top_10_ids)]
+            
+            fig_trend = px.line(
+                trend_data,
+                x='Period',
+                y='Cost',
+                color='AccountName',
+                title='Cost Trends (Top 10 Accounts)',
+                markers=True
+            )
+            fig_trend.update_layout(height=500)
+            st.plotly_chart(fig_trend, use_container_width=True)
+    
+    else:
+        # SHOW SINGLE ACCOUNT DETAILED VIEW
+        # Extract account ID from selection
+        account_id = selected_account.split('(')[1].split(')')[0]
+        account_data = current_accounts[current_accounts['AccountId'] == account_id].iloc[0]
+        account_name = account_data['AccountName']
+        
+        st.subheader(f"📊 Detailed Analysis: {account_name}")
+        st.caption(f"Account ID: {account_id}")
+        
+        # Account metrics
+        account_cost = account_data['Cost']
+        account_pct = (account_cost / total_cost * 100)
+        
+        col1, col2, col3, col4 = st.columns(4)
         
         with col1:
-            fig_accounts = px.bar(
-                current_accounts,
-                x='AccountId',
+            st.metric("Current Month Cost", f"${account_cost:,.2f}")
+        with col2:
+            st.metric("% of Total", f"{account_pct:.1f}%")
+        with col3:
+            rank = filtered_accounts[filtered_accounts['AccountId'] == account_id].index[0] + 1
+            st.metric("Cost Rank", f"#{rank} of {total_accounts}")
+        with col4:
+            # Calculate vs average
+            vs_avg = account_cost - avg_cost
+            st.metric("vs Avg", f"${vs_avg:,.2f}", f"{(vs_avg/avg_cost*100):+.1f}%")
+        
+        st.markdown("---")
+        
+        # Account trend
+        account_history = account_df[account_df['AccountId'] == account_id].sort_values('Period')
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**📈 Cost Trend**")
+            fig_account_trend = px.line(
+                account_history,
+                x='Period',
                 y='Cost',
-                title='Cost by Account',
-                color='Cost',
-                color_continuous_scale='Blues'
+                markers=True,
+                title=f'{account_name} - Cost History'
             )
-            st.plotly_chart(fig_accounts, use_container_width=True)
+            fig_account_trend.update_traces(line_color='#FF9900', line_width=3)
+            st.plotly_chart(fig_account_trend, use_container_width=True)
         
         with col2:
+            st.markdown("**📊 Historical Data**")
             st.dataframe(
-                current_accounts[['AccountId', 'Cost']].style.format({'Cost': '${:,.2f}'}),
+                account_history[['Period', 'Cost']].style.format({
+                    'Cost': '${:,.2f}',
+                    'Period': lambda x: x.strftime('%Y-%m')
+                }),
                 use_container_width=True,
                 height=400
             )
         
-        # Trend by account
-        fig_trend = px.line(
-            account_df,
-            x='Period',
-            y='Cost',
-            color='AccountId',
-            title='Cost Trend by Account'
+        # Month-over-month change
+        if len(account_history) >= 2:
+            current_cost = account_history.iloc[-1]['Cost']
+            previous_cost = account_history.iloc[-2]['Cost']
+            mom_change = current_cost - previous_cost
+            mom_pct = (mom_change / previous_cost * 100) if previous_cost > 0 else 0
+            
+            if mom_pct > 10:
+                st.warning(f"⚠️ **Alert:** This account's cost increased by **${mom_change:,.2f} ({mom_pct:+.1f}%)** compared to last month")
+            elif mom_pct < -10:
+                st.success(f"✅ **Good news:** This account's cost decreased by **${abs(mom_change):,.2f} ({mom_pct:.1f}%)** compared to last month")
+            else:
+                st.info(f"📊 Month-over-month change: **${mom_change:,.2f} ({mom_pct:+.1f}%)**")
+        
+        # Service breakdown for this account (if available)
+        st.markdown("---")
+        st.markdown("**💡 Recommendation:**")
+        st.info(f"""
+        **For account {account_name}:**
+        - Current spend: ${account_cost:,.2f}/month (${account_cost/30:.2f}/day)
+        - Represents {account_pct:.1f}% of total organization cost
+        - Consider reviewing top services in this account for optimization opportunities
+        """)
+    
+    # Account grouping (optional)
+    with st.expander("🏷️ Group Accounts by Cost Range"):
+        st.markdown("**Account Distribution by Cost Range:**")
+        
+        cost_ranges = pd.cut(
+            current_accounts['Cost'],
+            bins=[0, 100, 1000, 10000, float('inf')],
+            labels=['< $100', '$100 - $1,000', '$1,000 - $10,000', '> $10,000']
         )
-        st.plotly_chart(fig_trend, use_container_width=True)
-    else:
-        st.info("No multi-account data available")
+        
+        range_summary = current_accounts.groupby(cost_ranges, observed=False).agg({
+            'AccountId': 'count',
+            'Cost': 'sum'
+        }).rename(columns={'AccountId': 'Count', 'Cost': 'Total Cost'})
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.dataframe(
+                range_summary.style.format({
+                    'Total Cost': '${:,.2f}'
+                }),
+                use_container_width=True
+            )
+        
+        with col2:
+            fig_ranges = px.pie(
+                values=range_summary['Count'],
+                names=range_summary.index,
+                title='Account Distribution'
+            )
+            st.plotly_chart(fig_ranges, use_container_width=True)
 
 
 def show_tag_analysis(analyzer, months_back, user):
