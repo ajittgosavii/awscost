@@ -1,0 +1,20 @@
+[server]
+fileWatcherType = "none"
+runOnSave = false
+headless = true
+
+[runner]
+fastReruns = true
+```
+
+---
+
+## 📁 Your GitHub Repository Structure
+
+After adding the config file, it should look like this:
+```
+your-repo/
+├── .streamlit/              ← CREATE THIS FOLDER
+│   └── config.toml          ← ADD THIS FILE
+├── streamlit_app.py         ← Already there
+└── requirements.txt         ← Already there
