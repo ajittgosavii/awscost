@@ -51,13 +51,22 @@ st.markdown("""
 def load_credentials():
     """Load credentials from Streamlit secrets with detailed error handling"""
     try:
-        # Try to access AWS credentials
-        aws_access_key = st.secrets["aws"]["access_key_id"]
-        aws_secret_key = st.secrets["aws"]["secret_access_key"]
-        aws_region = st.secrets["aws"].get("region", "us-east-1")
+        # Try to access AWS credentials (supporting both uppercase and lowercase)
+        try:
+            aws_access_key = st.secrets["aws"]["AWS_ACCESS_KEY_ID"]
+            aws_secret_key = st.secrets["aws"]["AWS_SECRET_ACCESS_KEY"]
+            aws_region = st.secrets["aws"].get("AWS_DEFAULT_REGION", "us-east-1")
+        except KeyError:
+            # Fallback to lowercase keys
+            aws_access_key = st.secrets["aws"]["access_key_id"]
+            aws_secret_key = st.secrets["aws"]["secret_access_key"]
+            aws_region = st.secrets["aws"].get("region", "us-east-1")
         
-        # Try to access Anthropic credentials
-        claude_key = st.secrets["anthropic"]["api_key"]
+        # Try to access Anthropic credentials (supporting both uppercase and lowercase)
+        try:
+            claude_key = st.secrets["anthropic"]["ANTHROPIC_API_KEY"]
+        except KeyError:
+            claude_key = st.secrets["anthropic"]["api_key"]
         
         # Validate that keys are not placeholder values
         if "YOUR_" in aws_access_key or "YOUR_" in aws_secret_key or "YOUR_" in claude_key:
@@ -198,18 +207,7 @@ class AWSCostAnalyzer:
             region_name=region
         )
     
-    def get_monthly_comparison(self, months_back: int = 3):
-        """Get cost comparison for the last N months"""
-        try:
-            end_date = datetime.now().date()
-            start_date = end_date - timedelta(days=months_back * 30)
-            
-            response = self.ce_client.get_cost_and_usage(
-                TimePeriod={
-                    'Start': start_date.strftime('%Y-%m-%d'),
-                    'End': end_date.strftime('%Y-%m-%d')
-                },
-                Granularity='MONTHLY',
+Granularity='MONTHLY',
                 Metrics=['UnblendedCost', 'UsageQuantity'],
                 GroupBy=[
                     {'Type': 'DIMENSION', 'Key': 'SERVICE'}
@@ -245,6 +243,45 @@ class AWSCostAnalyzer:
             st.error(f"❌ Error fetching AWS data: {str(e)}")
             st.info("💡 Ensure AWS Cost Explorer is enabled (takes 24hrs after enabling)")
             return None, None
+    
+    def get_regional_breakdown(self, months_back: int = 3):
+        """Get cost breakdown by region"""
+        try:
+            end_date = datetime.now().date()
+            start_date = end_date - timedelta(days=months_back * 30)
+            
+            response = self.ce_client.get_cost_and_usage(
+                TimePeriod={
+                    'Start': start_date.strftime('%Y-%m-%d'),
+                    'End': end_date.strftime('%Y-%m-%d')
+                },
+                Granularity='MONTHLY',
+                Metrics=['UnblendedCost'],
+                GroupBy=[
+                    {'Type': 'DIMENSION', 'Key': 'REGION'}
+                ]
+            )
+            
+            # Parse regional data
+            regional_data = []
+            for result in response['ResultsByTime']:
+                period_start = result['TimePeriod']['Start']
+                for group in result['Groups']:
+                    region = group['Keys'][0]
+                    cost = float(group['Metrics']['UnblendedCost']['Amount'])
+                    
+                    if cost > 0:  # Only include regions with actual costs
+                        regional_data.append({
+                            'Period': period_start,
+                            'Region': region,
+                            'Cost': cost
+                        })
+            
+            return pd.DataFrame(regional_data)
+            
+        except Exception as e:
+            st.error(f"❌ Error fetching regional data: {str(e)}")
+            return pd.DataFrame()
     
     def _calculate_changes(self, df):
         """Calculate month-over-month changes"""
@@ -361,8 +398,108 @@ def create_visualizations(monthly_df, comparison_df):
     fig_pie.update_layout(title='Top 10 Services', height=400)
     
     # Changes
-    significant = comparison_df[abs(comparison_df['Cost_Change_%']) > 10].nlargest(15, 'Cost_Difference', key=abs)
+    significant = comparison_df[abs(comparison_df['Cost_Change_%']) > 10].copy()
     if len(significant) > 0:
+        significant['Abs_Cost_Difference'] = significant['Cost_Difference'].abs()
+        significant = significant.nlargest(15, 'Abs_Cost_Difference')
+        colors = ['#2ecc71' if x < 0 else '#e74c3c' for x in significant['Cost_Difference']]
+        fig_change = go.Figure(data=[go.Bar(
+            x=significant['Service'],
+            y=significant['Cost_Difference'],
+            marker_color=colors,
+            text=significant['Cost_Difference'].apply(lambda x: f'${x:.2f}'),
+            textposition='outside'
+        )])
+        fig_change.update_layout(title='Significant Changes (>10%)', xaxis_tickangle=-45, height=400)
+    else:
+        fig_change = None
+    
+    return fig_trend, fig_pie, fig_change
+
+
+def create_regional_charts(regional_df):
+    """Create regional breakdown visualizations"""
+    if regional_df.empty:
+        return None, None
+    
+    regional_df['Period'] = pd.to_datetime(regional_df['Period'])
+    
+    # Get current month data
+    current_period = regional_df['Period'].max()
+    current_regional = regional_df[regional_df['Period'] == current_period].sort_values('Cost', ascending=False)
+    
+    # Regional pie chart
+    fig_regional_pie = go.Figure(data=[go.Pie(
+        labels=current_regional['Region'],
+        values=current_regional['Cost'],
+        hole=.3,
+        marker=dict(colors=px.colors.qualitative.Pastel)
+    )])
+    fig_regional_pie.update_layout(
+        title='Current Month Cost by Region',
+        height=400
+    )
+    
+    # Regional trend over time
+    fig_regional_trend = go.Figure()
+    
+    # Add trace for each region
+    for region in regional_df['Region'].unique():
+        region_data = regional_df[regional_df['Region'] == region].sort_values('Period')
+        fig_regional_trend.add_trace(go.Scatter(
+            x=region_data['Period'],
+            y=region_data['Cost'],
+            mode='lines+markers',
+            name=region,
+            line=dict(width=2),
+            marker=dict(size=8)
+        ))
+    
+    fig_regional_trend.update_layout(
+        title='Cost Trend by Region',
+        xaxis_title='Month',
+        yaxis_title='Cost (USD)',
+        height=400,
+        hovermode='x unified',
+        legend=dict(orientation="v", yanchor="top", y=1, xanchor="left", x=1.05)
+    )
+    
+    return fig_regional_pie, fig_regional_trend
+
+
+def create_visualizations(monthly_df, comparison_df):
+    """Create all visualization charts"""
+    
+    # Monthly trend
+    monthly_summary = monthly_df.groupby('Period')['Cost'].sum().reset_index().sort_values('Period')
+    
+    fig_trend = go.Figure()
+    fig_trend.add_trace(go.Scatter(
+        x=monthly_summary['Period'],
+        y=monthly_summary['Cost'],
+        mode='lines+markers',
+        name='Total Cost',
+        line=dict(color='#FF9900', width=3),
+        marker=dict(size=10),
+        fill='tozeroy',
+        fillcolor='rgba(255, 153, 0, 0.1)'
+    ))
+    fig_trend.update_layout(title='Monthly Cost Trend', xaxis_title='Month', yaxis_title='Cost (USD)', height=400)
+    
+    # Service breakdown
+    top_services = comparison_df.nlargest(10, 'Current_Cost')
+    fig_pie = go.Figure(data=[go.Pie(
+        labels=top_services['Service'],
+        values=top_services['Current_Cost'],
+        hole=.3
+    )])
+    fig_pie.update_layout(title='Top 10 Services', height=400)
+    
+    # Changes
+    significant = comparison_df[abs(comparison_df['Cost_Change_%']) > 10].copy()
+    if len(significant) > 0:
+        significant['Abs_Cost_Difference'] = significant['Cost_Difference'].abs()
+        significant = significant.nlargest(15, 'Abs_Cost_Difference')
         colors = ['#2ecc71' if x < 0 else '#e74c3c' for x in significant['Cost_Difference']]
         fig_change = go.Figure(data=[go.Bar(
             x=significant['Service'],
@@ -427,6 +564,12 @@ def main():
             - AWS Cost Explorer enabled
             - 24 hours of data available
             - IAM permission: `ce:GetCostAndUsage`
+            
+            **About Regional Costs:**
+            - The "Region" setting (us-east-1) is just the API endpoint
+            - Cost Explorer automatically aggregates costs from **ALL AWS regions worldwide**
+            - The "Regional Breakdown" section shows costs split by region
+            - You'll see costs from all regions where you have AWS resources
             """)
     
     # Main content
@@ -442,8 +585,12 @@ def main():
                     st.error("❌ No data. Ensure Cost Explorer is enabled and has 24+ hours of data.")
                     st.stop()
                 
+                # Also fetch regional breakdown
+                regional_df = analyzer.get_regional_breakdown(months)
+                
                 st.session_state['monthly_df'] = monthly_df
                 st.session_state['comparison_df'] = comparison_df
+                st.session_state['regional_df'] = regional_df
                 
             except Exception as e:
                 st.error(f"❌ Error: {str(e)}")
@@ -474,6 +621,40 @@ def main():
         
         if fig_change:
             st.plotly_chart(fig_change, use_container_width=True)
+        
+        st.markdown("---")
+        
+        # Regional Breakdown
+        st.subheader("🌍 Regional Cost Breakdown")
+        regional_df = st.session_state.get('regional_df', pd.DataFrame())
+        
+        if not regional_df.empty:
+            fig_regional_pie, fig_regional_trend = create_regional_charts(regional_df)
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                if fig_regional_pie:
+                    st.plotly_chart(fig_regional_pie, use_container_width=True)
+            with col2:
+                if fig_regional_trend:
+                    st.plotly_chart(fig_regional_trend, use_container_width=True)
+            
+            # Regional data table
+            regional_df_display = regional_df.copy()
+            regional_df_display['Period'] = pd.to_datetime(regional_df_display['Period'])
+            current_period = regional_df_display['Period'].max()
+            current_regional = regional_df_display[regional_df_display['Period'] == current_period].sort_values('Cost', ascending=False)
+            
+            st.write("**Current Month Regional Costs:**")
+            st.dataframe(
+                current_regional[['Region', 'Cost']].style.format({
+                    'Cost': '${:,.2f}'
+                }),
+                use_container_width=True,
+                height=300
+            )
+        else:
+            st.info("ℹ️ No regional data available. This may indicate all costs are in a single region or global services.")
         
         st.markdown("---")
         
@@ -563,14 +744,16 @@ def main():
         st.info("👋 Click '🔍 Analyze Costs' in the sidebar to start!")
         
         col1, col2 = st.columns(2)
+        
         with col1:
             st.markdown("""
             ### ✨ Features
-            - 📊 Monthly cost comparison
-            - 📈 Interactive charts
-            - 🔍 Service breakdown
-            - 🤖 AI insights
-            - 💾 Export reports
+            - 📊 Monthly cost comparison across all services
+            - 🌍 Regional cost breakdown (all AWS regions)
+            - 📈 Interactive charts and visualizations
+            - 🔍 Service-level cost analysis
+            - 🤖 AI-powered insights from Claude
+            - 💾 Export reports in CSV/TXT format
             """)
         
         with col2:
